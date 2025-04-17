@@ -26,12 +26,13 @@ log.setLevel(logging.INFO)
 # ---------- mood mapping table ----------
 # Feel free to tweak / extend without touching code:
 MOOD_MAP = {
-    "Happy":    ["Smile", "Joy", "Fun", "Celebration"],
-    "Romantic": ["Couple", "Valentine", "Wedding", "Kiss"],
-    "Nature":   ["Landscape", "Mountain", "Plant", "Forest", "Beach"],
-    "Urban":    ["City", "Building", "Street", "Metropolis"],
-    "Sad":      ["Rain", "Tear", "Lonely", "Fog"]
-}
+        'happy': ['smile', 'happy', 'joy', 'celebration', 'party', 'fun', 'laugh'],
+        'calm': ['nature', 'water', 'sea', 'ocean', 'sky', 'cloud', 'mountain', 'landscape', 'sunset'],
+        'energetic': ['sport', 'running', 'exercise', 'adventure', 'action', 'jump', 'dance'],
+        'romantic': ['couple', 'love', 'candle', 'flower', 'date', 'wedding'],
+        'melancholy': ['rain', 'fog', 'mist', 'night', 'shadow', 'dark', 'alone'],
+        'neutral': ['person', 'people', 'portrait', 'face', 'building', 'urban', 'city']
+    }
 
 # ---------- helpers ----------
 def label_list(image_bytes, max_labels=25):
