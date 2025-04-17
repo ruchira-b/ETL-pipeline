@@ -43,7 +43,7 @@ def upload_to_s3(s3_client, file_path, bucket_name):
                     "ContentType": content_type,
                     "Metadata": {
                         "uploaded-by": "ruchira",
-                        "project": "image-upload-test"
+                        "project": "image-upload-4300"
                     }
                 },
             )
