@@ -21,41 +21,64 @@ load_dotenv()
 
 # Set page configuration with a clean aesthetic
 st.set_page_config(
-    page_title="Image Insight Explorer",
+    page_title="Pics Wrapped",
     page_icon="📷",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # Custom CSS for aesthetic UI
 st.markdown("""
 <style>
+    /* Using CSS variables for theme-aware styling */
+    :root {
+        --text-color: #333;
+        --background-color: #f8f9fa;
+        --card-background: white;
+        --accent-color: #5046e4;
+        --accent-hover: #3731b3;
+        --metric-color: #5046e4;
+        --card-shadow: 0 4px 8px rgba(0,0,0,0.05);
+    }
+
+    /* Dark theme overrides */
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --text-color: #e6e6e6;
+            --background-color: #1e1e1e;
+            --card-background: #2d2d2d;
+            --accent-color: #6c63ff;
+            --accent-hover: #5046e4;
+            --metric-color: #6c63ff;
+            --card-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+    }
+    
     /* Main page styling */
     .main {
-        background-color: #f8f9fa;
-        color: #333;
+        color: var(--text-color);
         font-family: 'Helvetica Neue', sans-serif;
     }
     
     /* Headers */
     h1, h2, h3 {
         font-family: 'Helvetica Neue', sans-serif;
-        color: #1e1e1e;
+        color: var(--text-color);
         font-weight: 600;
     }
     
     /* Custom container for cards */
     .css-1r6slb0 {
-        background-color: white;
+        background-color: var(--card-background);
         border-radius: 10px;
         padding: 20px;
-        box-shadow: 0 4px 8px rgba(0,0,0,0.05);
+        box-shadow: var(--card-shadow);
         margin-bottom: 20px;
     }
     
     /* Streamlit elements styling */
     .stButton>button {
-        background-color: #5046e4;
+        background-color: var(--accent-color);
         color: white;
         border-radius: 8px;
         font-weight: 500;
@@ -65,65 +88,52 @@ st.markdown("""
     }
     
     .stButton>button:hover {
-        background-color: #3731b3;
+        background-color: var(--accent-hover);
         box-shadow: 0 4px 8px rgba(0,0,0,0.1);
     }
     
     /* Custom metrics */
     .metric-card {
-        background-color: white;
+        background-color: var(--card-background);
         border-radius: 8px;
         padding: 16px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        box-shadow: var(--card-shadow);
         text-align: center;
     }
     
     .metric-value {
         font-size: 28px;
         font-weight: 700;
-        color: #5046e4;
+        color: var(--metric-color);
         margin-bottom: 4px;
     }
     
     .metric-label {
         font-size: 14px;
-        color: #333;
+        color: var(--text-color);
     }
     
     /* File uploader styling */
     .stFileUploader {
         padding: 10px;
         border-radius: 8px;
-        background-color: #f0f2f6;
     }
     
     /* Progress bar styling */
     .stProgress > div > div > div {
-        background-color: #5046e4;
+        background-color: var(--accent-color);
     }
     
-    /* Ensure all text is black */
-    p, div, span, label, .stMarkdown, .stInfo, .stSuccess, .stWarning, .stError {
-        color: #333 !important;
+    /* Ensure all text has proper contrast */
+    p, div, span, label, .stMarkdown {
+        color: var(--text-color) !important;
     }
     
-    /* Ensure info/success/warning/error messages have proper contrast */
-    .stInfo {
-        background-color: #e0f2ff !important;
-        border-color: #72b8ff !important;
+    /* Ensure info/success/warning/error messages have proper contrast in both themes */
+    .stInfo, .stSuccess, .stWarning, .stError {
+        color: var(--text-color) !important;
     }
-    .stSuccess {
-        background-color: #d7f5e8 !important;
-        border-color: #81e6c7 !important;
-    }
-    .stWarning {
-        background-color: #fff8e1 !important;
-        border-color: #ffd54f !important;
-    }
-    .stError {
-        background-color: #ffe7e6 !important;
-        border-color: #ff9e99 !important;
-    }
+
 
 </style>
 """, unsafe_allow_html=True)
