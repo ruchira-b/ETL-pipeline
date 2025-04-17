@@ -2,7 +2,6 @@ import json
 import os
 import uuid
 import boto3
-import io
 import logging
 from datetime import datetime
 from PIL import Image, ExifTags
