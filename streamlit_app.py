@@ -14,6 +14,10 @@ from datetime import datetime
 import uuid
 from io import BytesIO
 import tempfile
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Set page configuration with a clean aesthetic
 st.set_page_config(
@@ -100,32 +104,46 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# AWS configuration - use environment variables or secrets manager
+# AWS configuration - load from .env file 
 def get_aws_credentials():
-    # For local development, credentials can be set in the environment or using st.secrets
-    # In production on EC2, instance roles should be used
+    # Credentials already loaded via load_dotenv() at the top
     return {
-        "aws_access_key_id": st.secrets.get("AWS_ACCESS_KEY_ID", os.environ.get("AWS_ACCESS_KEY_ID", "")),
-        "aws_secret_access_key": st.secrets.get("AWS_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "")),
-        "region_name": st.secrets.get("AWS_REGION", os.environ.get("AWS_REGION", "us-east-1"))
+        "aws_access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+        "aws_secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+        "region_name": os.environ.get("AWS_REGION", "us-east-1")
     }
 
 # Initialize AWS clients
 @st.cache_resource
 def get_s3_client():
     credentials = get_aws_credentials()
-    return boto3.client('s3', **credentials)
+    
+    # Check if credentials are available
+    if not credentials["aws_access_key_id"] or not credentials["aws_secret_access_key"]:
+        st.error("AWS credentials not found in .env file. Please check your .env file configuration.")
+        return None
+    
+    try:
+        return boto3.client('s3', **credentials)
+    except Exception as e:
+        st.error(f"Error initializing S3 client: {e}")
+        return None
 
-# S3 bucket names - match with your infrastructure (s3_upload.py and preprocess.py)
-RAW_BUCKET = "landingpg1014"  # Matches your s3_upload.py bucket
-PROCESSED_BUCKET = os.environ.get("OUTPUT_BUCKET", "processingdata4300")  # Matches your preprocess.py OUTPUT_BUCKET
-THUMB_PREFIX = os.environ.get("THUMB_PREFIX", "thumbs/")  # Matches your preprocess.py THUMB_PREFIX
-META_PREFIX = os.environ.get("META_PREFIX", "meta/")  # Matches your preprocess.py META_PREFIX
-UPLOADS_PREFIX = "uploads/"  # Matches your s3_upload.py upload path
+# S3 bucket names - get from environment variables loaded from .env
+RAW_BUCKET = os.environ.get("S3_BUCKET_NAME", "landingpg1014")  # Get from environment or use default
+PROCESSED_BUCKET = os.environ.get("OUTPUT_BUCKET", "processingdata4300")  # Get from environment or use default
+THUMB_PREFIX = "thumbs/"  # Default value
+META_PREFIX = "meta/"  # Default value
+UPLOADS_PREFIX = "uploads/"  # Default value
 
 # Function to upload files to S3 landing bucket
 def upload_to_s3(file_bytes, filename, user_id="ruchira"):
     s3_client = get_s3_client()
+    
+    # Check if client was initialized successfully
+    if s3_client is None:
+        return False, None
+        
     try:
         # Create key in the format matching your s3_upload.py
         key = f"{UPLOADS_PREFIX}{filename}"
@@ -152,6 +170,10 @@ def upload_to_s3(file_bytes, filename, user_id="ruchira"):
 def get_analysis_results(user_id):
     """Get analysis summary for a user by aggregating individual image metadata"""
     s3_client = get_s3_client()
+    
+    # Check if client was initialized successfully
+    if s3_client is None:
+        return None
     
     try:
         # List all metadata files
@@ -302,6 +324,10 @@ def check_processing_status(user_id):
     """Check if any images have been processed for this user"""
     s3_client = get_s3_client()
     
+    # Check if client was initialized successfully
+    if s3_client is None:
+        return False
+    
     try:
         # List raw uploads
         raw_response = s3_client.list_objects_v2(
@@ -379,6 +405,21 @@ def main():
         st.image("https://via.placeholder.com/150x150.png?text=Photo+Insights", width=150)
         st.title("Upload & Analyze")
         st.write("Upload up to 50 images to discover insights about your collection.")
+        
+        # Display current configuration
+        with st.expander("🔧 Current Configuration"):
+            st.write(f"Raw Bucket: {RAW_BUCKET}")
+            st.write(f"Processed Bucket: {PROCESSED_BUCKET}")
+            st.write(f"User ID: {st.session_state.user_id}")
+            region = os.environ.get("AWS_REGION", "Not set")
+            st.write(f"AWS Region: {region}")
+            
+            # Check AWS credentials
+            creds = get_aws_credentials()
+            has_key = bool(creds["aws_access_key_id"])
+            has_secret = bool(creds["aws_secret_access_key"])
+            st.write(f"AWS Access Key: {'✅ Found' if has_key else '❌ Missing'}")
+            st.write(f"AWS Secret Key: {'✅ Found' if has_secret else '❌ Missing'}")
         
         # Help expander
         with st.expander("ℹ️ How it works"):
@@ -478,7 +519,7 @@ def main():
                                 # Switch to analysis tab
                                 st.success("Image processing complete! View your analysis in the Analysis tab.")
                             else:
-                                st.error("Failed to upload images. Please try again.")
+                                st.error("Failed to upload images. Please check AWS credentials in your .env file.")
         
         with col2:
             st.markdown("""
