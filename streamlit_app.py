@@ -87,7 +87,7 @@ st.markdown("""
     
     .metric-label {
         font-size: 14px;
-        color: #666;
+        color: #333;
     }
     
     /* File uploader styling */
@@ -101,6 +101,30 @@ st.markdown("""
     .stProgress > div > div > div {
         background-color: #5046e4;
     }
+    
+    /* Ensure all text is black */
+    p, div, span, label, .stMarkdown, .stInfo, .stSuccess, .stWarning, .stError {
+        color: #333 !important;
+    }
+    
+    /* Ensure info/success/warning/error messages have proper contrast */
+    .stInfo {
+        background-color: #e0f2ff !important;
+        border-color: #72b8ff !important;
+    }
+    .stSuccess {
+        background-color: #d7f5e8 !important;
+        border-color: #81e6c7 !important;
+    }
+    .stWarning {
+        background-color: #fff8e1 !important;
+        border-color: #ffd54f !important;
+    }
+    .stError {
+        background-color: #ffe7e6 !important;
+        border-color: #ff9e99 !important;
+    }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -184,6 +208,7 @@ def get_analysis_results(user_id):
         
         # If no metadata files found yet, return None
         if 'Contents' not in response:
+            st.warning(f"No metadata files found in {PROCESSED_BUCKET}/{META_PREFIX}")
             return None
             
         # Collect metadata from all processed images for this user
@@ -195,6 +220,7 @@ def get_analysis_results(user_id):
                     Key=item['Key']
                 )
                 metadata = json.loads(obj['Body'].read().decode('utf-8'))
+                
                 # Filter for this user's images only
                 if metadata.get('user') == user_id:
                     all_metadata.append(metadata)
@@ -203,6 +229,7 @@ def get_analysis_results(user_id):
                 
         # If no metadata was successfully loaded for this user, return None
         if not all_metadata:
+            st.warning(f"No metadata found for user {user_id}")
             return None
             
         # Aggregate the data to create summary statistics
@@ -441,15 +468,38 @@ def main():
         
         # Mock uploader option for testing
         with st.expander("🧪 Developer Options"):
-            if st.button("Process 52 Test Images"):
-                with st.spinner("Simulating processing of 52 test images..."):
-                    st.session_state.uploaded = True
-                    st.session_state.using_mock_data = True
-                    progress_bar = st.progress(0)
-                    for i in range(10):
-                        time.sleep(0.2)
-                        progress_bar.progress((i+1)/10)
-                    st.success("Mock processing complete! View your analysis in the Analysis tab.")
+            if st.button("Check Processing Status"):
+                status = check_processing_status(st.session_state.user_id)
+                if isinstance(status, float):
+                    st.info(f"Processing in progress: {status*100:.1f}% complete")
+                elif status is True:
+                    st.success("All images have been processed!")
+                else:
+                    st.warning("No processed images found yet.")
+                    
+                # Display the bucket contents for debugging
+                st.write("Raw bucket contents:")
+                try:
+                    s3_client = get_s3_client()
+                    if s3_client:
+                        raw_response = s3_client.list_objects_v2(Bucket=RAW_BUCKET)
+                        if 'Contents' in raw_response:
+                            for item in raw_response['Contents']:
+                                st.write(f"- {item['Key']}")
+                        else:
+                            st.write("No files in raw bucket.")
+                            
+                        st.write("Processed bucket contents:")
+                        proc_response = s3_client.list_objects_v2(Bucket=PROCESSED_BUCKET)
+                        if 'Contents' in proc_response:
+                            meta_files = [item for item in proc_response['Contents'] if item['Key'].startswith(META_PREFIX)]
+                            st.write(f"Found {len(meta_files)} metadata files:")
+                            for item in meta_files[:5]:  # Show first 5 to avoid clutter
+                                st.write(f"- {item['Key']}")
+                        else:
+                            st.write("No files in processed bucket.")
+                except Exception as e:
+                    st.error(f"Error checking bucket contents: {e}")
     
     # Main content tabs
     tab1, tab2 = st.tabs(["📤 Upload Images", "📊 View Analysis"])
@@ -542,43 +592,8 @@ def main():
         if st.session_state.uploaded:
             # If using mock data or real data
             if st.session_state.get('using_mock_data', False):
-                # Generate mock data for demonstration of the 52 images
-                analysis_data = {
-                    "mood_analysis": {
-                        "Happy": 42,
-                        "Nature": 25,
-                        "Urban": 18,
-                        "Romantic": 10,
-                        "Sad": 5
-                    },
-                    "common_objects": {
-                        "person": 35,
-                        "landscape": 22,
-                        "building": 15,
-                        "plant": 12,
-                        "city": 10,
-                        "mountain": 8,
-                        "beach": 7,
-                        "water": 6,
-                        "sky": 5,
-                        "tree": 4
-                    },
-                    "color_palette": [
-                        {"color": "#4287f5", "percentage": 25},
-                        {"color": "#42f5aa", "percentage": 22},
-                        {"color": "#f5da42", "percentage": 18},
-                        {"color": "#f55f42", "percentage": 15},
-                        {"color": "#8742f5", "percentage": 12},
-                        {"color": "#f542f2", "percentage": 8}
-                    ],
-                    "nature_percentage": 37,
-                    "time_distribution": {
-                        "morning": 15,
-                        "afternoon": 42,
-                        "evening": 32,
-                        "night": 11
-                    }
-                }
+                st.error("Mock data feature has been disabled. Please use real data.")
+                st.stop()
             else:
                 # Try to get real analysis results from S3
                 analysis_data = get_analysis_results(st.session_state.user_id)
@@ -787,21 +802,82 @@ def main():
                     )
             else:
                 # Display a waiting message if no data yet
-                st.info("Waiting for image analysis to complete... This may take a few minutes.")
-                st.progress(0.6)  # Show progress indicator
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.info("Waiting for image analysis to complete... This may take a few minutes.")
+                    st.progress(0.6)  # Show progress indicator
                 
-                if st.button("Generate Demo Results (for testing)"):
-                    st.session_state.using_mock_data = True
-                    st.experimental_rerun()
+                with col2:
+                    if st.button("Check Status"):
+                        status = check_processing_status(st.session_state.user_id)
+                        if isinstance(status, float):
+                            st.info(f"Processing: {status*100:.1f}% complete")
+                        elif status is True:
+                            st.success("Processing complete! Refreshing...")
+                            st.experimental_rerun()
+                        else:
+                            st.warning("No processed images found yet. Lambda function may still be initializing.")
+                
+                # Debug information section
+                with st.expander("Show Debugging Information"):
+                    st.write("Troubleshooting Information:")
+                    st.write(f"User ID: {st.session_state.user_id}")
+                    st.write(f"Raw Bucket: {RAW_BUCKET}")
+                    st.write(f"Processed Bucket: {PROCESSED_BUCKET}")
+                    st.write(f"Metadata Prefix: {META_PREFIX}")
+                    
+                    if st.button("Check S3 Buckets"):
+                        try:
+                            s3_client = get_s3_client()
+                            
+                            if s3_client:
+                                # Check raw bucket
+                                st.write("### Raw Bucket Contents")
+                                raw_response = s3_client.list_objects_v2(
+                                    Bucket=RAW_BUCKET,
+                                    Prefix=UPLOADS_PREFIX
+                                )
+                                
+                                if 'Contents' in raw_response:
+                                    for item in raw_response['Contents']:
+                                        try:
+                                            meta = s3_client.head_object(Bucket=RAW_BUCKET, Key=item['Key'])
+                                            user = meta.get('Metadata', {}).get('uploaded-by', 'unknown')
+                                            st.write(f"- {item['Key']} (User: {user})")
+                                        except:
+                                            st.write(f"- {item['Key']}")
+                                else:
+                                    st.write("No files found in raw bucket")
+                                
+                                # Check processed bucket
+                                st.write("### Processed Bucket Contents")
+                                proc_response = s3_client.list_objects_v2(
+                                    Bucket=PROCESSED_BUCKET,
+                                    Prefix=META_PREFIX
+                                )
+                                
+                                if 'Contents' in proc_response:
+                                    for item in proc_response['Contents']:
+                                        st.write(f"- {item['Key']}")
+                                        
+                                        # Try to read the metadata
+                                        try:
+                                            obj = s3_client.get_object(
+                                                Bucket=PROCESSED_BUCKET,
+                                                Key=item['Key']
+                                            )
+                                            metadata = json.loads(obj['Body'].read().decode('utf-8'))
+                                            st.write(f"  User: {metadata.get('user', 'Not found')}")
+                                        except Exception as e:
+                                            st.write(f"  Error reading metadata: {e}")
+                                else:
+                                    st.write("No files found in processed bucket")
+                        except Exception as e:
+                            st.error(f"Error checking buckets: {e}")
         else:
             # Prompt user to upload images first
             st.info("Please upload images in the Upload tab to see analysis results.")
-            
-            # Option to use mock data for testing
-            if st.button("Try with Sample Data"):
-                st.session_state.uploaded = True
-                st.session_state.using_mock_data = True
-                st.experimental_rerun()
+
 
 # Run the app
 if __name__ == "__main__":
