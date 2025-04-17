@@ -1,420 +1,255 @@
-import json
-import os
-import uuid
-import boto3
-import logging
-from datetime import datetime
-from PIL import Image, ExifTags
+from sklearn.cluster import KMeans
+import os, io, json, uuid, logging, datetime
 import numpy as np
-from io import BytesIO
+import boto3,  botocore
+from PIL import Image, ExifTags
+from dotenv import load_dotenv
+load_dotenv()
 
-# Set up logging
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+rekog = boto3.client("rekognition",
+    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    region_name=os.getenv("AWS_REGION", "us-east-2")
+)
 
-# Initialize AWS clients
-s3 = boto3.client('s3')
-rekognition = boto3.client('rekognition')
-
-# Configuration
-THUMBNAIL_SIZE = (300, 300)
-OUTPUT_BUCKET = os.environ.get('OUTPUT_BUCKET', 'processingdata4300')
-THUMBS_PREFIX = 'thumbnails/'
-META_PREFIX = 'metadata/'
-UPLOADS_PREFIX = 'uploads/'
+# ---------- configuration ----------
+PROC_BUCKET   = os.getenv("OUTPUT_BUCKET")               # destination bucket
+THUMB_PREFIX  = os.getenv("THUMB_PREFIX", "thumbs/")    # key prefix for thumbs
+META_PREFIX   = os.getenv("META_PREFIX",  "meta/")      # key prefix for JSON
 
 
-def extract_time_data(image):
-    """Extract time data from image EXIF metadata"""
-    time_data = {
-        'hour_of_day': None,
-        'date': None,
-        'timestamp': None
-    }
+s3    = boto3.client("s3")
+
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+# ---------- mood mapping table ----------
+# Feel free to tweak / extend without touching code:
+MOOD_MAP = {
+    "Happy":    ["Smile", "Joy", "Fun", "Celebration"],
+    "Romantic": ["Couple", "Valentine", "Wedding", "Kiss"],
+    "Nature":   ["Landscape", "Mountain", "Plant", "Forest", "Beach"],
+    "Urban":    ["City", "Building", "Street", "Metropolis"],
+    "Sad":      ["Rain", "Tear", "Lonely", "Fog"]
+}
+
+# ---------- helpers ----------
+def label_list(image_bytes, max_labels=25):
+    resp = rekog.detect_labels(Image={"Bytes": image_bytes},
+                               MaxLabels=max_labels, MinConfidence=70)
+    return resp["Labels"]
+
+def kmeans_palette(img_rgb, k=5):
+    """
+    Return k dominant colours as [[R,G,B], …] using scikit‑learn KMeans.
+    img_rgb: np.ndarray (H,W,3) in RGB uint8 [0..255]
+    """
+    pixels = img_rgb.reshape(-1, 3)               # (N,3)
+    km = KMeans(n_clusters=k, n_init="auto", random_state=0).fit(pixels)
+    centers = km.cluster_centers_.astype(int)     # shape (k,3)
+    return centers.tolist()
+
+def choose_mood(labels):
+    set_names = {l["Name"] for l in labels}
+    for mood, keys in MOOD_MAP.items():
+        if set_names.intersection(keys):
+            return mood
+    return "Undefined"
+
+def hour_bucket(exif_ts, event_iso):
+    """Return Morning / Afternoon / Evening / Night"""
+    if exif_ts:
+        try:
+            hour = int(exif_ts.split()[1].split(":")[0])
+        except Exception:
+            hour = None
+    else:
+        hour = None
+    if hour is None:
+        hour = datetime.datetime.fromisoformat(event_iso.replace("Z","")).hour
+
+    return ("Night"     if hour < 6  else
+            "Morning"   if hour < 12 else
+            "Afternoon" if hour < 18 else
+            "Evening")
+
+def is_nature(labels):
+    return any(l["Name"] in ("Landscape", "Plant", "Outdoor", "Mountain", "Beach")
+               for l in labels)
+
+# ---------- main handler ----------
+def handler(event, context):
+    rec = event["Records"][0]
+    src_bucket = rec["s3"]["bucket"]["name"]
+    src_key    = rec["s3"]["object"]["key"]
+    event_time = rec["eventTime"]
+    log.info(f"Triggered by s3://{src_bucket}/{src_key}")
 
     try:
-        exif_data = {}
-        exif = image._getexif()
-        if exif:
-            for tag, value in exif.items():
-                tag_name = ExifTags.TAGS.get(tag, tag)
-                exif_data[tag_name] = value
+        # 1. fetch original
+        obj = s3.get_object(Bucket=src_bucket, Key=src_key)
+        orig_bytes = obj["Body"].read()
 
-            # Look for DateTimeOriginal or DateTime tag
-            if 'DateTimeOriginal' in exif_data:
-                dt_str = exif_data['DateTimeOriginal']
-                dt = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S')
-                time_data['hour_of_day'] = dt.hour
-                time_data['date'] = dt.strftime('%Y-%m-%d')
-                time_data['timestamp'] = int(dt.timestamp())
-            elif 'DateTime' in exif_data:
-                dt_str = exif_data['DateTime']
-                dt = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S')
-                time_data['hour_of_day'] = dt.hour
-                time_data['date'] = dt.strftime('%Y-%m-%d')
-                time_data['timestamp'] = int(dt.timestamp())
+        # 2. open in Pillow, strip EXIF, resize to 1024 px max
+        img = Image.open(io.BytesIO(orig_bytes))
+        img_clean = Image.new(img.mode, img.size)
+        img_clean.putdata(list(img.getdata()))
+        img_clean.thumbnail((1024, 1024))
+
+        # 3. Rekognition labels & faces
+        labels = label_list(orig_bytes)
+        faces  = rekog.detect_faces(Image={"Bytes": orig_bytes},
+                                    Attributes=['DEFAULT'])["FaceDetails"]
+        has_people = len(faces) > 0
+
+        # 4. dominant colours (OpenCV wants RGB ndarray)
+        img_rgb = np.array(img_clean)
+        palette = kmeans_palette(img_rgb, k=5)
+
+        # 5. extra attributes
+        exif  = img.getexif()
+        exif_ts = exif.get(36867) if exif else None
+        mood  = choose_mood(labels)
+        nature_flag = is_nature(labels)
+        tod   = hour_bucket(exif_ts, event_time)
+
+        # 6. build metadata doc
+        photo_id = str(uuid.uuid4())
+        user_prefix = src_key.split("/")[0]   # assumes <user_id>/filename.jpeg
+        meta = {
+            "photo_id":   photo_id,
+            "user":       user_prefix,
+            "src_key":    src_key,
+            "timestamp":  event_time,
+            "mood":       mood,
+            "labels":     [l["Name"] for l in labels],
+            "has_people": has_people,
+            "dominant_colors": palette,       # [[R,G,B],…]
+            "is_nature":  nature_flag,
+            "time_bucket": tod
+        }
+
+        # 7. save cleaned image
+        out_full = io.BytesIO()
+        img_clean.save(out_full, format="JPEG", quality=90)
+        s3.put_object(Bucket=PROC_BUCKET,
+                      Key=f"images/{photo_id}.jpg",
+                      Body=out_full.getvalue(),
+                      ContentType="image/jpeg")
+        log.info(f"Writing cleaned image to s3://{PROC_BUCKET}/images/{photo_id}.jpg")
+
+        #    save thumbnail (256 px)
+        thumb = img_clean.copy()
+        thumb.thumbnail((256, 256))
+        out_thumb = io.BytesIO()
+        thumb.save(out_thumb, format="JPEG", quality=80)
+        s3.put_object(Bucket=PROC_BUCKET,
+                      Key=f"{THUMB_PREFIX}{photo_id}.jpg",
+                      Body=out_thumb.getvalue(),
+                      ContentType="image/jpeg")
+
+        #    save meta JSON
+        s3.put_object(Bucket=PROC_BUCKET,
+                      Key=f"{META_PREFIX}{photo_id}.json",
+                      Body=json.dumps(meta).encode("utf-8"),
+                      ContentType="application/json")
+
+        log.info(f"Processed {src_key} → photo_id={photo_id}")
+        return {"statusCode": 200, "body": "ok"}
+
+    except botocore.exceptions.ClientError as e:
+        log.error(f"S3 error: {e}")
+        raise
     except Exception as e:
-        print(f"Error extracting time data: {e}")
-        # Use current time as fallback
-        now = datetime.now()
-        time_data['hour_of_day'] = now.hour
-        time_data['date'] = now.strftime('%Y-%m-%d')
-        time_data['timestamp'] = int(now.timestamp())
-
-    return time_data
+        log.exception("Unhandled error in preprocess lambda")
+        raise
 
 
-def extract_dominant_colors(image, num_colors=5):
-    """Extract the dominant colors from an image"""
-    logger.info("Extracting dominant colors from image")
+# --- add this new reusable wrapper ---
+def process_s3_image(src_bucket, src_key, event_time):
+    log.info(f"Processing image from s3://{src_bucket}/{src_key}")
 
-    # Resize image to speed up processing
-    img_small = image.resize((150, 150))
-    # Convert to RGB if not already
-    if img_small.mode != 'RGB':
-        img_small = img_small.convert('RGB')
+    # 1. fetch original
+    obj = s3.get_object(Bucket=src_bucket, Key=src_key)
+    orig_bytes = obj["Body"].read()
 
-    # Get image data as numpy array
-    img_array = np.array(img_small)
-    # Reshape the array to be a list of pixels
-    pixels = img_array.reshape(-1, 3)
+    # 2. open in Pillow, strip EXIF, resize to 1024 px max
+    img = Image.open(io.BytesIO(orig_bytes))
+    img_clean = Image.new(img.mode, img.size)
+    img_clean.putdata(list(img.getdata()))
+    img_clean.thumbnail((1024, 1024))
 
-    # Use a simple clustering approach to find dominant colors
-    # This is a simplified version - in production you might want to use k-means clustering
-    unique_colors, counts = np.unique(pixels, axis=0, return_counts=True)
+    # 3. Rekognition labels & faces
+    labels = label_list(orig_bytes)
+    faces = rekog.detect_faces(Image={"Bytes": orig_bytes},
+                               Attributes=['DEFAULT'])["FaceDetails"]
+    has_people = len(faces) > 0
 
-    # Sort colors by frequency
-    indices = np.argsort(-counts)
-    sorted_colors = unique_colors[indices]
-    sorted_counts = counts[indices]
+    # 4. dominant colours (OpenCV wants RGB ndarray)
+    img_rgb = np.array(img_clean)
+    palette = kmeans_palette(img_rgb, k=5)
 
-    # Get top colors
-    top_colors = []
-    for i in range(min(num_colors, len(sorted_colors))):
-        rgb = sorted_colors[i]
-        hex_color = '#{:02x}{:02x}{:02x}'.format(rgb[0], rgb[1], rgb[2])
-        frequency = float(sorted_counts[i]) / len(pixels)
-        top_colors.append({
-            'hex': hex_color,
-            'rgb': rgb.tolist(),
-            'frequency': frequency
-        })
+    # 5. extra attributes
+    exif = img.getexif()
+    exif_ts = exif.get(36867) if exif else None
+    mood = choose_mood(labels)
+    nature_flag = is_nature(labels)
+    tod = hour_bucket(exif_ts, event_time)
 
-    logger.info(f"Found {len(top_colors)} dominant colors")
-    return top_colors
-
-
-def map_mood_from_rekognition(labels):
-    """Map image content to mood based on Rekognition labels"""
-    # Define mood mappings
-    mood_keywords = {
-        'happy': ['smile', 'happy', 'joy', 'celebration', 'party', 'fun', 'laugh'],
-        'calm': ['nature', 'water', 'sea', 'ocean', 'sky', 'cloud', 'mountain', 'landscape', 'sunset'],
-        'energetic': ['sport', 'running', 'exercise', 'adventure', 'action', 'jump', 'dance'],
-        'romantic': ['couple', 'love', 'candle', 'flower', 'date', 'wedding'],
-        'melancholy': ['rain', 'fog', 'mist', 'night', 'shadow', 'dark', 'alone'],
-        'neutral': ['person', 'people', 'portrait', 'face', 'building', 'urban', 'city']
+    # 6. build metadata doc
+    photo_id = str(uuid.uuid4())
+    user_prefix = src_key.split("/")[0] if "/" in src_key else "unknown"
+    meta = {
+        "photo_id": photo_id,
+        "user": user_prefix,
+        "src_key": src_key,
+        "timestamp": event_time,
+        "mood": mood,
+        "labels": [l["Name"] for l in labels],
+        "has_people": has_people,
+        "dominant_colors": palette,  # [[R,G,B],…]
+        "is_nature": nature_flag,
+        "time_bucket": tod
     }
 
-    # Count matches for each mood
-    mood_scores = {mood: 0.0 for mood in mood_keywords}
-    for label in labels:
-        label_name = label['Name'].lower()
-        label_confidence = label['Confidence'] / 100.0
+    # 7. save cleaned image
+    out_full = io.BytesIO()
+    img_clean.save(out_full, format="JPEG", quality=90)
+    s3.put_object(Bucket=PROC_BUCKET,
+                  Key=f"images/{photo_id}.jpg",
+                  Body=out_full.getvalue(),
+                  ContentType="image/jpeg")
 
-        for mood, keywords in mood_keywords.items():
-            if any(keyword in label_name for keyword in keywords):
-                mood_scores[mood] += label_confidence
+    #    save thumbnail (256 px)
+    thumb = img_clean.copy()
+    thumb.thumbnail((256, 256))
+    out_thumb = io.BytesIO()
+    thumb.save(out_thumb, format="JPEG", quality=80)
+    s3.put_object(Bucket=PROC_BUCKET,
+                  Key=f"{THUMB_PREFIX}{photo_id}.jpg",
+                  Body=out_thumb.getvalue(),
+                  ContentType="image/jpeg")
 
-    # Get the highest scoring mood
-    if all(score == 0 for score in mood_scores.values()):
-        primary_mood = 'neutral'
-    else:
-        primary_mood = max(mood_scores, key=mood_scores.get)
+    #    save meta JSON
+    s3.put_object(Bucket=PROC_BUCKET,
+                  Key=f"{META_PREFIX}{photo_id}.json",
+                  Body=json.dumps(meta).encode("utf-8"),
+                  ContentType="application/json")
 
-    return {
-        'primary_mood': primary_mood,
-        'mood_scores': mood_scores
-    }
-
-
-def is_nature_image(labels, threshold=0.6):
-    """Determine if an image is a nature image based on Rekognition labels"""
-    nature_keywords = [
-        'nature', 'landscape', 'mountain', 'forest', 'tree', 'plant', 'flower',
-        'water', 'sea', 'ocean', 'beach', 'sky', 'cloud', 'sunset', 'sunrise', 'grass',
-        'park', 'lake', 'river', 'animal', 'bird', 'insect', 'outdoor'
-    ]
-
-    # Look for nature-related labels
-    nature_score = 0.0
-    highest_confidence = 0.0
-
-    for label in labels:
-        label_name = label['Name'].lower()
-        confidence = label['Confidence'] / 100.0
-
-        # Update highest confidence
-        if confidence > highest_confidence:
-            highest_confidence = confidence
-
-        # Check if label is nature-related
-        if any(keyword in label_name for keyword in nature_keywords):
-            nature_score += confidence
-
-    # Check for human-made objects that would indicate it's not nature
-    human_keywords = [
-        'building', 'city', 'urban', 'road', 'car', 'vehicle', 'electronics',
-        'furniture', 'indoors', 'room', 'house', 'architecture', 'computer'
-    ]
-
-    human_score = 0.0
-    for label in labels:
-        label_name = label['Name'].lower()
-        confidence = label['Confidence'] / 100.0
-
-        if any(keyword in label_name for keyword in human_keywords):
-            human_score += confidence
-
-    # Calculate ratio (if both scores are non-zero)
-    if human_score > 0 and nature_score > 0:
-        ratio = nature_score / (nature_score + human_score)
-    else:
-        ratio = 1.0 if nature_score > 0 else 0.0
-
-    return {
-        'is_nature': ratio > threshold,
-        'nature_score': nature_score,
-        'nature_ratio': ratio
-    }
+    log.info(f"Processed {src_key} → photo_id={photo_id}")
+    return meta
 
 
-def create_thumbnail(image):
-    """Create a thumbnail of the image"""
-    thumb = image.copy()
-    thumb.thumbnail(THUMBNAIL_SIZE)
+if __name__ == "__main__":
+    # Simulate an S3 event
+    test_bucket = "landingpg1014"
+    test_key = "uploads/tshirt.jpg"
+    test_event_time = datetime.datetime.utcnow().isoformat() + "Z"
 
-    # Save to BytesIO
-    thumbnail_bytes = BytesIO()
-    thumb.save(thumbnail_bytes, format='JPEG')
-    thumbnail_bytes.seek(0)
-
-    return thumbnail_bytes
-
-
-def extract_objects(labels, min_confidence=70):
-    """
-    Extract the most common objects from Rekognition labels
-    with counts and confidence scores
-    """
-    logger.info("Extracting objects from Rekognition labels")
-
-    objects = []
-    # Filter labels with confidence above threshold
-    for label in labels:
-        if label['Confidence'] >= min_confidence:
-            objects.append({
-                'name': label['Name'],
-                'confidence': label['Confidence'],
-                'parents': [parent['Name'] for parent in label.get('Parents', [])]
-            })
-
-    # Count instances of parent categories for better aggregation
-    parent_counts = {}
-    for obj in objects:
-        for parent in obj.get('parents', []):
-            if parent in parent_counts:
-                parent_counts[parent] += 1
-            else:
-                parent_counts[parent] = 1
-
-    logger.info(f"Found {len(objects)} objects above confidence threshold")
-    return {
-        'objects': objects,
-        'parent_categories': parent_counts
-    }
-
-
-def lambda_handler(event, context):
-    """
-    Main Lambda handler function
-
-    Expected event format:
-    {
-        "Records": [
-            {
-                "s3": {
-                    "bucket": {
-                        "name": "processingdata4300"
-                    },
-                    "object": {
-                        "key": "uploads/image.jpg"
-                    }
-                },
-                "userIdentity": {
-                    "principalId": "user-id"  # Optional
-                }
-            }
-        ]
-    }
-    """
-    logger.info("Lambda function started")
     try:
-        # Extract event info
-        logger.info("Processing new image upload event")
-        record = event['Records'][0]
-        input_bucket = record['s3']['bucket']['name']
-        input_key = record['s3']['object']['key']
-
-        logger.info(f"Image uploaded to bucket: {input_bucket}, key: {input_key}")
-
-        # Try to get user ID from various possible locations
-        user_id = None
-
-        # Check if the key starts with 'uploads/' as in your S3 uploader
-        if input_key.startswith(UPLOADS_PREFIX):
-            # Extract metadata from S3 object to get the 'uploaded-by' field
-            try:
-                response = s3.head_object(Bucket=input_bucket, Key=input_key)
-                if 'Metadata' in response and 'uploaded-by' in response['Metadata']:
-                    user_id = response['Metadata']['uploaded-by']
-                    logger.info(f"Found user ID in metadata: {user_id}")
-            except Exception as e:
-                logger.warning(f"Error retrieving object metadata: {str(e)}")
-
-        # Fallback if user ID is still not found
-        if not user_id:
-            # Check userIdentity in the event
-            if 'userIdentity' in record and 'principalId' in record['userIdentity']:
-                user_id = record['userIdentity']['principalId']
-                logger.info(f"Using user ID from principalId: {user_id}")
-            # Check if user ID is in the object key path
-            else:
-                key_parts = input_key.split('/')
-                if len(key_parts) > 1 and key_parts[0] == 'users':
-                    user_id = key_parts[1]
-                    logger.info(f"Using user ID from path: {user_id}")
-
-        # Final fallback
-        if not user_id:
-            user_id = 'ruchira'  # Match your uploader's default
-            logger.info(f"No user ID found, using default: {user_id}")
-
-        # Create a unique image ID (use original filename + UUID)
-        filename = os.path.basename(input_key)
-        file_base = os.path.splitext(filename)[0]
-        image_id = f"{file_base}-{str(uuid.uuid4())[:8]}"
-
-        # Get the image from S3
-        s3_response = s3.get_object(Bucket=input_bucket, Key=input_key)
-        image_bytes = s3_response['Body'].read()
-
-        # Open image with PIL
-        image = Image.open(BytesIO(image_bytes))
-
-        # Extract time data
-        time_data = extract_time_data(image)
-
-        # Call Rekognition for object and scene detection
-        logger.info("Calling AWS Rekognition for image analysis")
-        rekognition_response = rekognition.detect_labels(
-            Image={'Bytes': image_bytes},
-            MaxLabels=50,
-            MinConfidence=50
-        )
-
-        labels = rekognition_response['Labels']
-        logger.info(f"Rekognition found {len(labels)} labels in the image")
-
-        # Extract dominant colors
-        colors = extract_dominant_colors(image)
-
-        # Map mood from Rekognition labels
-        logger.info("Mapping mood from image content")
-        mood_data = map_mood_from_rekognition(labels)
-        logger.info(f"Primary mood detected: {mood_data['primary_mood']}")
-
-        # Check if it's a nature image
-        logger.info("Analyzing if image contains nature")
-        nature_data = is_nature_image(labels)
-        logger.info(f"Nature image: {nature_data['is_nature']} (score: {nature_data['nature_score']:.2f})")
-
-        # Extract objects for goal #2: most common objects
-        logger.info("Extracting object information")
-        object_data = extract_objects(labels)
-        logger.info(f"Found {len(object_data['objects'])} significant objects")
-
-        # Create metadata object
-        metadata = {
-            'image_id': image_id,
-            'user_id': user_id,
-            'original_key': input_key,
-            'timestamp': time_data['timestamp'],
-            'date': time_data['date'],
-            'hour_of_day': time_data['hour_of_day'],
-            'colors': colors,
-            'labels': labels,
-            'objects': object_data,  # Added dedicated objects section
-            'mood': mood_data,
-            'nature': nature_data,
-            'processed_at': int(datetime.now().timestamp())
-        }
-
-        # Create thumbnail
-        thumbnail_bytes = create_thumbnail(image)
-
-        # Upload metadata to S3
-        meta_key = f"{META_PREFIX}{user_id}/{image_id}.json"
-        logger.info(f"Saving metadata to S3: {meta_key}")
-        s3.put_object(
-            Bucket=OUTPUT_BUCKET,
-            Key=meta_key,
-            Body=json.dumps(metadata, indent=2),
-            ContentType='application/json'
-        )
-
-        # Upload thumbnail to S3
-        thumb_key = f"{THUMBS_PREFIX}{user_id}/{image_id}.jpg"
-        logger.info(f"Saving thumbnail to S3: {thumb_key}")
-        s3.put_object(
-            Bucket=OUTPUT_BUCKET,
-            Key=thumb_key,
-            Body=thumbnail_bytes.getvalue(),
-            ContentType='image/jpeg'
-        )
-
-        # Print summary of processing
-        logger.info("=== Image Processing Summary ===")
-        logger.info(f"Image ID: {image_id}")
-        logger.info(f"User ID: {user_id}")
-        logger.info(f"Primary mood: {mood_data['primary_mood']}")
-        logger.info(f"Nature score: {nature_data['nature_score']:.2f}")
-        logger.info(f"Top objects: {', '.join([obj['name'] for obj in object_data['objects'][:3]])}")
-        logger.info(f"Dominant color: {colors[0]['hex']}")
-        logger.info(f"Time of day: {time_data['hour_of_day']}:00")
-        logger.info("==============================")
-
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'message': 'Image processed successfully',
-                'metadata_key': meta_key,
-                'thumbnail_key': thumb_key,
-                'image_id': image_id,
-                'summary': {
-                    'mood': mood_data['primary_mood'],
-                    'is_nature': nature_data['is_nature'],
-                    'top_objects': [obj['name'] for obj in object_data['objects'][:3]],
-                    'dominant_color': colors[0]['hex']
-                }
-            })
-        }
-
+        print(test_bucket, test_key)
+        result = process_s3_image(test_bucket, test_key, test_event_time)
+        print("✅ Successfully processed image!")
+        print(json.dumps(result, indent=2))
     except Exception as e:
-        logger.error(f"Error processing image: {str(e)}", exc_info=True)
-        return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'error': str(e)
-            })
-        }
+        print("❌ Error processing image:", e)
