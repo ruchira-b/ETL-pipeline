@@ -118,9 +118,10 @@ def get_s3_client():
 
 # S3 bucket names - match with your infrastructure (s3_upload.py and preprocess.py)
 RAW_BUCKET = "landingpg1014"  # Matches your s3_upload.py bucket
-PROCESSED_BUCKET = "processingdata4300"  # Matches your preprocess.py OUTPUT_BUCKET
-META_PREFIX = "metadata/"  # Matches your preprocess.py META_PREFIX
-UPLOADS_PREFIX = "uploads/"  # Matches your preprocess.py UPLOADS_PREFIX
+PROCESSED_BUCKET = os.environ.get("OUTPUT_BUCKET", "processingdata4300")  # Matches your preprocess.py OUTPUT_BUCKET
+THUMB_PREFIX = os.environ.get("THUMB_PREFIX", "thumbs/")  # Matches your preprocess.py THUMB_PREFIX
+META_PREFIX = os.environ.get("META_PREFIX", "meta/")  # Matches your preprocess.py META_PREFIX
+UPLOADS_PREFIX = "uploads/"  # Matches your s3_upload.py upload path
 
 # Function to upload files to S3 landing bucket
 def upload_to_s3(file_bytes, filename, user_id="ruchira"):
@@ -153,17 +154,17 @@ def get_analysis_results(user_id):
     s3_client = get_s3_client()
     
     try:
-        # List all metadata files for this user
+        # List all metadata files
         response = s3_client.list_objects_v2(
             Bucket=PROCESSED_BUCKET,
-            Prefix=f"{META_PREFIX}{user_id}/"
+            Prefix=f"{META_PREFIX}"
         )
         
         # If no metadata files found yet, return None
         if 'Contents' not in response:
             return None
             
-        # Collect metadata from all processed images
+        # Collect metadata from all processed images for this user
         all_metadata = []
         for item in response.get('Contents', []):
             try:
@@ -172,11 +173,13 @@ def get_analysis_results(user_id):
                     Key=item['Key']
                 )
                 metadata = json.loads(obj['Body'].read().decode('utf-8'))
-                all_metadata.append(metadata)
+                # Filter for this user's images only
+                if metadata.get('user') == user_id:
+                    all_metadata.append(metadata)
             except Exception as e:
                 st.warning(f"Error reading metadata file {item['Key']}: {e}")
                 
-        # If no metadata was successfully loaded, return None
+        # If no metadata was successfully loaded for this user, return None
         if not all_metadata:
             return None
             
@@ -195,46 +198,41 @@ def aggregate_analysis_data(all_metadata):
     # Initialize counters and collectors
     mood_counts = {}
     object_counts = {}
-    time_counts = {"morning": 0, "afternoon": 0, "evening": 0, "night": 0}
+    time_counts = {"Morning": 0, "Afternoon": 0, "Evening": 0, "Night": 0}
     color_samples = []
     nature_scores = []
     
     # Process each image metadata
     for metadata in all_metadata:
         # Aggregate mood data
-        if 'mood' in metadata and 'primary_mood' in metadata['mood']:
-            primary_mood = metadata['mood']['primary_mood']
-            mood_counts[primary_mood] = mood_counts.get(primary_mood, 0) + 1
+        if 'mood' in metadata:
+            mood = metadata['mood']
+            mood_counts[mood] = mood_counts.get(mood, 0) + 1
         
         # Aggregate object data
-        if 'objects' in metadata and 'objects' in metadata['objects']:
-            for obj in metadata['objects']['objects']:
-                obj_name = obj['name'].lower()
+        if 'labels' in metadata:
+            for label in metadata['labels']:
+                obj_name = label.lower()
                 object_counts[obj_name] = object_counts.get(obj_name, 0) + 1
         
         # Aggregate time data
-        if 'hour_of_day' in metadata:
-            hour = metadata['hour_of_day']
-            if 5 <= hour < 12:
-                time_counts["morning"] += 1
-            elif 12 <= hour < 17:
-                time_counts["afternoon"] += 1
-            elif 17 <= hour < 21:
-                time_counts["evening"] += 1
-            else:
-                time_counts["night"] += 1
+        if 'time_bucket' in metadata:
+            time_bucket = metadata['time_bucket']
+            time_counts[time_bucket] = time_counts.get(time_bucket, 0) + 1
         
         # Collect color data
-        if 'colors' in metadata and metadata['colors']:
-            for color in metadata['colors']:
+        if 'dominant_colors' in metadata and metadata['dominant_colors']:
+            for color_rgb in metadata['dominant_colors']:
+                # Convert RGB to hex
+                hex_color = '#{:02x}{:02x}{:02x}'.format(color_rgb[0], color_rgb[1], color_rgb[2])
                 color_samples.append({
-                    'hex': color['hex'],
-                    'frequency': color['frequency']
+                    'hex': hex_color,
+                    'frequency': 1.0 / len(metadata['dominant_colors'])  # Equal weight per color
                 })
         
         # Collect nature scores
-        if 'nature' in metadata and 'nature_ratio' in metadata['nature']:
-            nature_scores.append(metadata['nature']['nature_ratio'])
+        if 'is_nature' in metadata:
+            nature_scores.append(1.0 if metadata['is_nature'] else 0.0)
     
     # Calculate aggregated color palette
     color_palette = aggregate_colors(color_samples)
@@ -250,7 +248,7 @@ def aggregate_analysis_data(all_metadata):
     
     # Ensure all time periods have values
     total_time_images = sum(time_counts.values())
-    time_distribution = {k: int((v / total_time_images) * 100) if total_time_images > 0 else 0 
+    time_distribution = {k.lower(): int((v / total_time_images) * 100) if total_time_images > 0 else 0 
                          for k, v in time_counts.items()}
     
     # Get top objects (up to 10)
@@ -299,36 +297,65 @@ def aggregate_colors(color_samples, num_colors=6):
     
     return color_palette
 
-# Function to check if analysis is complete
+# Function to check if any images for this user have been processed
 def check_processing_status(user_id):
-    """Check if all uploaded images have been processed"""
+    """Check if any images have been processed for this user"""
     s3_client = get_s3_client()
     
     try:
-        # Count raw uploads for this user
+        # List raw uploads
         raw_response = s3_client.list_objects_v2(
             Bucket=RAW_BUCKET,
-            Prefix=f"{user_id}/"
+            Prefix=f"{UPLOADS_PREFIX}"
         )
-        raw_count = len(raw_response.get('Contents', []))
         
-        # Count processed metadata files
+        # If no raw uploads found, return False
+        if 'Contents' not in raw_response:
+            return False
+        
+        # Count user's raw uploads
+        raw_count = 0
+        for item in raw_response.get('Contents', []):
+            # Check metadata to see if it belongs to this user
+            try:
+                meta = s3_client.head_object(Bucket=RAW_BUCKET, Key=item['Key'])
+                if meta.get('Metadata', {}).get('uploaded-by') == user_id:
+                    raw_count += 1
+            except Exception:
+                pass
+                
+        # List processed metadata files 
         processed_response = s3_client.list_objects_v2(
             Bucket=PROCESSED_BUCKET,
-            Prefix=f"{META_PREFIX}{user_id}/"
+            Prefix=f"{META_PREFIX}"
         )
-        processed_count = len(processed_response.get('Contents', []))
         
-        # If no uploads found, return False
+        # Count this user's processed files
+        processed_count = 0
+        for item in processed_response.get('Contents', []):
+            try:
+                obj = s3_client.get_object(
+                    Bucket=PROCESSED_BUCKET,
+                    Key=item['Key']
+                )
+                metadata = json.loads(obj['Body'].read().decode('utf-8'))
+                if metadata.get('user') == user_id:
+                    processed_count += 1
+            except Exception:
+                pass
+                
+        # If no uploaded images for this user, return False
         if raw_count == 0:
             return False
             
-        # If all images have been processed, return True
-        if processed_count >= raw_count:
-            return True
-            
-        # Otherwise, return the progress percentage
-        return processed_count / raw_count
+        # If at least some images have been processed, return True or progress percentage
+        if processed_count > 0:
+            if processed_count >= raw_count:
+                return True
+            else:
+                return processed_count / raw_count
+        else:
+            return 0.0
     except Exception as e:
         st.warning(f"Error checking processing status: {e}")
         return False
@@ -370,6 +397,18 @@ def main():
             
             The analysis pipeline extracts insights about your images and displays them in this dashboard.
             """)
+        
+        # Mock uploader option for testing
+        with st.expander("🧪 Developer Options"):
+            if st.button("Process 52 Test Images"):
+                with st.spinner("Simulating processing of 52 test images..."):
+                    st.session_state.uploaded = True
+                    st.session_state.using_mock_data = True
+                    progress_bar = st.progress(0)
+                    for i in range(10):
+                        time.sleep(0.2)
+                        progress_bar.progress((i+1)/10)
+                    st.success("Mock processing complete! View your analysis in the Analysis tab.")
     
     # Main content tabs
     tab1, tab2 = st.tabs(["📤 Upload Images", "📊 View Analysis"])
@@ -460,8 +499,48 @@ def main():
         
         # Check if analysis results are available
         if st.session_state.uploaded:
-            # Real implementation: Try to get analysis results from S3
-            analysis_data = get_analysis_results(st.session_state.user_id)
+            # If using mock data or real data
+            if st.session_state.get('using_mock_data', False):
+                # Generate mock data for demonstration of the 52 images
+                analysis_data = {
+                    "mood_analysis": {
+                        "Happy": 42,
+                        "Nature": 25,
+                        "Urban": 18,
+                        "Romantic": 10,
+                        "Sad": 5
+                    },
+                    "common_objects": {
+                        "person": 35,
+                        "landscape": 22,
+                        "building": 15,
+                        "plant": 12,
+                        "city": 10,
+                        "mountain": 8,
+                        "beach": 7,
+                        "water": 6,
+                        "sky": 5,
+                        "tree": 4
+                    },
+                    "color_palette": [
+                        {"color": "#4287f5", "percentage": 25},
+                        {"color": "#42f5aa", "percentage": 22},
+                        {"color": "#f5da42", "percentage": 18},
+                        {"color": "#f55f42", "percentage": 15},
+                        {"color": "#8742f5", "percentage": 12},
+                        {"color": "#f542f2", "percentage": 8}
+                    ],
+                    "nature_percentage": 37,
+                    "time_distribution": {
+                        "morning": 15,
+                        "afternoon": 42,
+                        "evening": 32,
+                        "night": 11
+                    }
+                }
+            else:
+                # Try to get real analysis results from S3
+                analysis_data = get_analysis_results(st.session_state.user_id)
             
             if analysis_data:
                 # Display results in a dashboard layout
@@ -497,7 +576,7 @@ def main():
                         objects_data = pd.DataFrame({
                             'Object': list(analysis_data["common_objects"].keys()),
                             'Count': list(analysis_data["common_objects"].values())
-                        }).sort_values('Count', ascending=False)
+                        }).sort_values('Count', ascending=False).head(8)  # Show top 8 for readability
                         
                         fig = px.bar(
                             objects_data,
@@ -616,7 +695,7 @@ def main():
                         <div class="metric-card" style="height: 120px;">
                             <h4>Dominant Mood</h4>
                             <div class="metric-value" style="font-size: 22px;">{dominant_mood.title()}</div>
-                            <div class="metric-label">Your photos mostly convey {dominant_mood} emotions</div>
+                            <div class="metric-label">Your photos mostly convey {dominant_mood.lower()} emotions</div>
                         </div>
                         """, 
                         unsafe_allow_html=True
@@ -666,47 +745,12 @@ def main():
                         mime="application/json"
                     )
             else:
-                # Display a waiting message or offer to process mock data for demo purposes
+                # Display a waiting message if no data yet
                 st.info("Waiting for image analysis to complete... This may take a few minutes.")
                 st.progress(0.6)  # Show progress indicator
                 
                 if st.button("Generate Demo Results (for testing)"):
-                    # Generate mock data for demonstration
-                    analysis_data = {
-                        "mood_analysis": {
-                            "calm": 35,
-                            "happy": 25,
-                            "energetic": 20,
-                            "melancholic": 15,
-                            "neutral": 5
-                        },
-                        "common_objects": {
-                            "Person": 28,
-                            "Nature": 22,
-                            "Building": 15,
-                            "Animal": 12,
-                            "Food": 8,
-                            "Vehicle": 7,
-                            "Technology": 5,
-                            "Art": 3
-                        },
-                        "color_palette": [
-                            {"color": "#4287f5", "percentage": 25},
-                            {"color": "#42f5aa", "percentage": 22},
-                            {"color": "#f5da42", "percentage": 18},
-                            {"color": "#f55f42", "percentage": 15},
-                            {"color": "#8742f5", "percentage": 12},
-                            {"color": "#f542f2", "percentage": 8}
-                        ],
-                        "nature_percentage": 37,
-                        "time_distribution": {
-                            "morning": 15,
-                            "afternoon": 42,
-                            "evening": 32,
-                            "night": 11
-                        }
-                    }
-                    st.session_state.demo_data = analysis_data
+                    st.session_state.using_mock_data = True
                     st.experimental_rerun()
         else:
             # Prompt user to upload images first
@@ -715,6 +759,7 @@ def main():
             # Option to use mock data for testing
             if st.button("Try with Sample Data"):
                 st.session_state.uploaded = True
+                st.session_state.using_mock_data = True
                 st.experimental_rerun()
 
 # Run the app
