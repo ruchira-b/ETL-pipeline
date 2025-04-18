@@ -1,0 +1,626 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
+from PIL import Image, ExifTags
+import boto3
+import pymysql
+import io
+import os
+import json
+import time
+from datetime import datetime
+import uuid
+from io import BytesIO
+import tempfile
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Set page configuration with a clean aesthetic
+st.set_page_config(
+    page_title="Pics Wrapped",
+    page_icon="📷",
+    layout="wide",
+)
+
+# Custom CSS for theme-aware styling
+st.markdown("""
+<style>
+    /* Using CSS variables for theme-aware styling */
+    :root {
+        --text-color: #333;
+        --background-color: #f8f9fa;
+        --card-background: white;
+        --accent-color: #5046e4;
+        --accent-hover: #3731b3;
+        --metric-color: #5046e4;
+        --card-shadow: 0 4px 8px rgba(0,0,0,0.05);
+    }
+
+    /* Dark theme overrides */
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --text-color: #e6e6e6;
+            --background-color: #1e1e1e;
+            --card-background: #2d2d2d;
+            --accent-color: #6c63ff;
+            --accent-hover: #5046e4;
+            --metric-color: #6c63ff;
+            --card-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+    }
+
+    /* Main page styling */
+    .main {
+        color: var(--text-color);
+        font-family: 'Helvetica Neue', sans-serif;
+    }
+
+    /* Headers */
+    h1, h2, h3 {
+        font-family: 'Helvetica Neue', sans-serif;
+        color: var(--text-color);
+        font-weight: 600;
+    }
+
+    /* Custom container for cards */
+    .css-1r6slb0 {
+        background-color: var(--card-background);
+        border-radius: 10px;
+        padding: 20px;
+        box-shadow: var(--card-shadow);
+        margin-bottom: 20px;
+    }
+
+    /* Streamlit elements styling */
+    .stButton>button {
+        background-color: var(--accent-color);
+        color: white;
+        border-radius: 8px;
+        font-weight: 500;
+        border: none;
+        padding: 0.5rem 1rem;
+        transition: all 0.3s ease;
+    }
+
+    .stButton>button:hover {
+        background-color: var(--accent-hover);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+    }
+
+    /* Custom metrics */
+    .metric-card {
+        background-color: var(--card-background);
+        border-radius: 8px;
+        padding: 16px;
+        box-shadow: var(--card-shadow);
+        text-align: center;
+    }
+
+    .metric-value {
+        font-size: 28px;
+        font-weight: 700;
+        color: var(--metric-color);
+        margin-bottom: 4px;
+    }
+
+    .metric-label {
+        font-size: 14px;
+        color: var(--text-color);
+    }
+
+    /* File uploader styling */
+    .stFileUploader {
+        padding: 10px;
+        border-radius: 8px;
+    }
+
+    /* Progress bar styling */
+    .stProgress > div > div > div {
+        background-color: var(--accent-color);
+    }
+
+    /* Ensure all text has proper contrast */
+    p, div, span, label, .stMarkdown {
+        color: var(--text-color) !important;
+    }
+
+    /* Ensure info/success/warning/error messages have proper contrast in both themes */
+    .stInfo, .stSuccess, .stWarning, .stError {
+        color: var(--text-color) !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# AWS configuration - load from .env file
+def get_aws_credentials():
+    # Credentials already loaded via load_dotenv() at the top
+    return {
+        "aws_access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+        "aws_secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+        "region_name": os.environ.get("AWS_REGION", "us-east-2")
+    }
+
+
+# Initialize AWS clients
+@st.cache_resource
+def get_s3_client():
+    credentials = get_aws_credentials()
+
+    # Check if credentials are available
+    if not credentials["aws_access_key_id"] or not credentials["aws_secret_access_key"]:
+        st.error("AWS credentials not found in .env file. Please check your .env file configuration.")
+        return None
+
+    try:
+        return boto3.client('s3', **credentials)
+    except Exception as e:
+        st.error(f"Error initializing S3 client: {e}")
+        return None
+
+
+# S3 bucket names - get from environment variables loaded from .env
+RAW_BUCKET = os.environ.get("S3_BUCKET_NAME", "landingpg1015")  # Get from environment or use default
+UPLOADS_PREFIX = "uploads/"  # Default value
+
+
+# Function to get RDS connection
+def get_rds_connection():
+    try:
+        # Get RDS configuration from environment variables
+        rds_host = os.environ.get("RDS_HOST")
+        rds_user = os.environ.get("RDS_USER")
+        rds_password = os.environ.get("RDS_PASSWORD")
+        rds_db = os.environ.get("RDS_DB")
+
+        if not all([rds_host, rds_user, rds_password, rds_db]):
+            st.warning("RDS connection details missing in environment variables")
+            return None
+
+        # Connect to RDS
+        conn = pymysql.connect(
+            host=rds_host,
+            user=rds_user,
+            password=rds_password,
+            database=rds_db,
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        return conn
+    except Exception as e:
+        st.error(f"Error connecting to RDS: {str(e)}")
+        return None
+
+
+# Function to get RDS analysis results
+def get_rds_analysis_results(user_id="admin"):
+    """Get analysis summary from RDS database for a user"""
+    try:
+        conn = get_rds_connection()
+        if not conn:
+            return None
+
+        # Query the photo_wrapped_summary table
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM photo_wrapped_summary WHERE user_id = %s", (user_id,))
+            summary = cursor.fetchone()
+
+            if not summary:
+                st.info(f"No analysis data found for user {user_id}")
+                return None
+
+            # Get additional data for visualization
+            cursor.execute("""
+                SELECT DATE(upload_time) as day, COUNT(*) as count 
+                FROM image_metadata 
+                WHERE user_id = %s 
+                GROUP BY DATE(upload_time)
+                ORDER BY day
+            """, (user_id,))
+            daily_counts = cursor.fetchall()
+
+            # Get file types distribution
+            cursor.execute("""
+                SELECT content_type, COUNT(*) as count 
+                FROM image_metadata 
+                WHERE user_id = %s 
+                GROUP BY content_type
+            """, (user_id,))
+            file_types = cursor.fetchall()
+
+        conn.close()
+
+        # Convert summary to a format compatible with visualization code
+        analysis_data = {
+            "total_photos": summary["total_photos"],
+            "first_date": summary["first_date"].strftime("%Y-%m-%d"),
+            "last_date": summary["last_date"].strftime("%Y-%m-%d"),
+            "busiest_day": summary["busiest_day"].strftime("%Y-%m-%d"),
+            "busiest_day_count": summary["busiest_day_count"],
+            "avg_photos_per_day": float(summary["avg_photos_per_day"]),
+            "daily_upload_data": [{"date": item["day"].strftime("%Y-%m-%d"), "count": item["count"]} for item in
+                                  daily_counts],
+            "file_types": [{"type": item["content_type"], "count": item["count"]} for item in file_types]
+        }
+
+        return analysis_data
+
+    except Exception as e:
+        st.error(f"Error fetching RDS analysis data: {str(e)}")
+        return None
+
+
+# Function to upload files to S3 landing bucket
+def upload_to_s3(file_bytes, filename, user_id="admin"):
+    s3_client = get_s3_client()
+
+    # Check if client was initialized successfully
+    if s3_client is None:
+        return False, None
+
+    try:
+        # Create key in the format matching your s3_upload.py
+        key = f"{UPLOADS_PREFIX}{filename}"
+
+        # Use metadata matching your upload script
+        content_type = "image/jpeg" if filename.lower().endswith((".jpg", ".jpeg")) else "image/png"
+
+        s3_client.put_object(
+            Bucket=RAW_BUCKET,
+            Key=key,
+            Body=file_bytes,
+            ContentType=content_type,
+            Metadata={
+                "uploaded-by": user_id,
+                "project": "image-upload-4300"
+            }
+        )
+        return True, key
+    except Exception as e:
+        st.error(f"Error uploading to S3: {e}")
+        return False, None
+
+
+# Function to check processing status
+def check_processing_status(user_id):
+    """Check if any images have been processed for this user by querying RDS"""
+    try:
+        conn = get_rds_connection()
+        if not conn:
+            return False
+
+        with conn.cursor() as cursor:
+            # Count images in raw S3 bucket for this user
+            # This is an approximation since we can't directly query S3 metadata easily
+            s3_client = get_s3_client()
+            if not s3_client:
+                return False
+
+            # Count images in RDS for this user
+            cursor.execute("SELECT COUNT(*) as count FROM image_metadata WHERE user_id = %s", (user_id,))
+            result = cursor.fetchone()
+            processed_count = result["count"] if result else 0
+
+            # Check if analysis is complete
+            cursor.execute("SELECT * FROM photo_wrapped_summary WHERE user_id = %s", (user_id,))
+            analysis_complete = cursor.fetchone() is not None
+
+        conn.close()
+
+        # If analysis is complete, return True
+        if analysis_complete and processed_count > 0:
+            return True
+        elif processed_count > 0:
+            # Some images processed but analysis not complete
+            return 0.5
+        else:
+            return False
+
+    except Exception as e:
+        st.warning(f"Error checking processing status: {str(e)}")
+        return False
+
+
+# Main app layout
+def main():
+    # Header section
+    st.title("Pics Wrapped")
+    st.markdown("Discover what your photos say about you")
+
+    # Generate a unique user ID for this session if not already present
+    if 'user_id' not in st.session_state:
+        st.session_state.user_id = "admin"  # Default user ID
+
+    # Track upload status
+    if 'uploaded' not in st.session_state:
+        st.session_state.uploaded = False
+
+    # Track current view (upload or analysis)
+    if 'current_view' not in st.session_state:
+        st.session_state.current_view = "upload"
+
+    # Main content - show either upload or analysis view based on state
+    if st.session_state.current_view == "upload":
+        show_upload_view()
+    else:
+        show_analysis_view()
+
+    # Display current configuration in an expandable section at the bottom
+    with st.expander("Configuration Details"):
+        st.write(f"Raw Bucket: {RAW_BUCKET}")
+        st.write(f"User ID: {st.session_state.user_id}")
+        region = os.environ.get("AWS_REGION", "us-east-2")
+        st.write(f"AWS Region: {region}")
+
+        # Check AWS credentials
+        creds = get_aws_credentials()
+        has_key = bool(creds["aws_access_key_id"])
+        has_secret = bool(creds["aws_secret_access_key"])
+        st.write(f"AWS Access Key: {'Found' if has_key else 'Missing'}")
+        st.write(f"AWS Secret Key: {'Found' if has_secret else 'Missing'}")
+
+        # Check RDS connection
+        conn = get_rds_connection()
+        if conn:
+            st.write("RDS Connection: Connected")
+            conn.close()
+        else:
+            st.write("RDS Connection: Failed")
+
+
+# Upload view function
+def show_upload_view():
+    st.header("Upload Your Images")
+
+    uploaded_files = st.file_uploader(
+        "Select up to 50 images to analyze",
+        type=['jpg', 'jpeg', 'png'],
+        accept_multiple_files=True
+    )
+
+    if uploaded_files:
+        num_files = len(uploaded_files)
+        if num_files > 50:
+            st.warning("Please select a maximum of 50 images. Only the first 50 will be processed.")
+            uploaded_files = uploaded_files[:50]
+            num_files = 50
+
+        st.write(f"{num_files} image{'s' if num_files > 1 else ''} selected")
+
+        # Display upload button
+        if st.button("Process Images", key="process_btn"):
+            with st.spinner("Uploading and processing your images..."):
+                # Progress bar
+                progress_bar = st.progress(0)
+
+                # Upload each file to S3 raw bucket
+                uploaded_keys = []
+                for i, file in enumerate(uploaded_files):
+                    # Upload to S3
+                    success, key = upload_to_s3(
+                        file.getvalue(),
+                        file.name,
+                        st.session_state.user_id
+                    )
+
+                    if success and key:
+                        uploaded_keys.append(key)
+
+                    # Update progress
+                    progress = (i + 1) / len(uploaded_files)
+                    progress_bar.progress(progress)
+
+                    # Brief pause to show progress and not overwhelm S3
+                    time.sleep(0.1)
+
+                if uploaded_keys:
+                    st.success(f"Successfully uploaded {len(uploaded_keys)} images.")
+                    st.session_state.uploaded = True
+
+                    # Wait for processing to complete
+                    with st.spinner("Waiting for image processing to complete..."):
+                        for i in range(15):  # Wait up to ~15 seconds
+                            time.sleep(0.5)
+                            status = check_processing_status(st.session_state.user_id)
+                            if isinstance(status, float):
+                                progress_bar.progress(status)
+                            elif status:
+                                progress_bar.progress(1.0)
+                                break
+
+                    # Switch to analysis view
+                    st.success("Image processing complete! Switching to analysis view.")
+                    st.session_state.current_view = "analysis"
+                    st.experimental_rerun()
+                else:
+                    st.error("Failed to upload images. Please check AWS credentials.")
+    else:
+        st.write("Upload your photos to see what they reveal about you.")
+
+    # Add button to view analysis if already uploaded
+    if st.session_state.uploaded:
+        if st.button("View Analysis"):
+            st.session_state.current_view = "analysis"
+            st.experimental_rerun()
+
+
+# Analysis view function
+def show_analysis_view():
+    st.header("Your Image Collection Insights")
+
+    # Add button to return to upload
+    if st.button("Return to Upload"):
+        st.session_state.current_view = "upload"
+        st.experimental_rerun()
+
+    # Check if analysis results are available
+    if st.session_state.uploaded:
+        # Get results from RDS
+        analysis_data = get_rds_analysis_results(st.session_state.user_id)
+
+        if analysis_data:
+            # Display overview section
+            st.subheader("Upload Summary")
+
+            # Create metrics row
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                st.metric("Total Photos", analysis_data["total_photos"])
+
+            with col2:
+                st.metric("First Upload", analysis_data["first_date"])
+
+            with col3:
+                st.metric("Busiest Day", f"{analysis_data['busiest_day']}")
+
+            with col4:
+                st.metric("Avg Photos/Day", f"{analysis_data['avg_photos_per_day']:.1f}")
+
+            # Display upload timeline
+            st.subheader("Upload Timeline")
+            if "daily_upload_data" in analysis_data and analysis_data["daily_upload_data"]:
+                df = pd.DataFrame(analysis_data["daily_upload_data"])
+                fig = px.bar(
+                    df,
+                    x="date",
+                    y="count",
+                    labels={"date": "Date", "count": "Number of Photos"},
+                    title="Photos Uploaded per Day"
+                )
+                fig.update_layout(margin=dict(t=30, b=0, l=0, r=0))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No daily upload data available.")
+
+            # Display file type distribution
+            if "file_types" in analysis_data and analysis_data["file_types"]:
+                st.subheader("File Type Distribution")
+                df = pd.DataFrame(analysis_data["file_types"])
+                # Clean content type strings
+                df['type'] = df['type'].apply(lambda x: x.split('/')[-1].upper() if '/' in x else x)
+
+                fig = px.pie(
+                    df,
+                    values="count",
+                    names="type",
+                    title="Image Format Distribution",
+                    hole=0.4
+                )
+                fig.update_layout(
+                    margin=dict(t=30, b=0, l=0, r=0),
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Export options
+            st.subheader("Export Options")
+            export_cols = st.columns([1, 1, 2])
+
+            with export_cols[0]:
+                # Generate PDF report
+                report_data = f"""
+                Pics Wrapped Report
+                User: {st.session_state.user_id}
+                Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+                Summary:
+                Total Photos: {analysis_data["total_photos"]}
+                Date Range: {analysis_data["first_date"]} to {analysis_data["last_date"]}
+                Busiest Day: {analysis_data["busiest_day"]} ({analysis_data["busiest_day_count"]} photos)
+                Avg Photos/Day: {analysis_data["avg_photos_per_day"]:.1f}
+                """
+
+                st.download_button(
+                    label="Download Summary",
+                    data=report_data,
+                    file_name="pics_wrapped_report.txt",
+                    mime="text/plain"
+                )
+
+            with export_cols[1]:
+                st.download_button(
+                    label="Export JSON Data",
+                    data=json.dumps(analysis_data, indent=2),
+                    file_name="image_analysis_data.json",
+                    mime="application/json"
+                )
+        else:
+            # Display a waiting message if no data yet
+            st.info("Waiting for image analysis to complete... This may take a few minutes.")
+            st.progress(0.6)  # Show progress indicator
+
+            if st.button("Check Status"):
+                status = check_processing_status(st.session_state.user_id)
+                if isinstance(status, float):
+                    st.info(f"Processing: {status * 100:.1f}% complete")
+                elif status:
+                    st.success("Processing complete! Refreshing...")
+                    st.experimental_rerun()
+                else:
+                    st.warning("No processed images found yet. Processing may still be initializing.")
+
+            # Debug information section
+            with st.expander("Show Debugging Information"):
+                st.write("Troubleshooting Information:")
+                st.write(f"User ID: {st.session_state.user_id}")
+                st.write(f"Raw Bucket: {RAW_BUCKET}")
+
+                # Check RDS connection and tables
+                conn = get_rds_connection()
+                if conn:
+                    with conn.cursor() as cursor:
+                        # Check image_metadata table
+                        cursor.execute("SELECT COUNT(*) as count FROM image_metadata")
+                        metadata_count = cursor.fetchone()["count"]
+                        st.write(f"Total records in image_metadata table: {metadata_count}")
+
+                        # Check photo_wrapped_summary table
+                        cursor.execute("SELECT COUNT(*) as count FROM photo_wrapped_summary")
+                        summary_count = cursor.fetchone()["count"]
+                        st.write(f"Total records in photo_wrapped_summary table: {summary_count}")
+
+                        # Check for this user's data
+                        cursor.execute("SELECT COUNT(*) as count FROM image_metadata WHERE user_id = %s",
+                                       (st.session_state.user_id,))
+                        user_count = cursor.fetchone()["count"]
+                        st.write(f"Records for user {st.session_state.user_id} in image_metadata: {user_count}")
+
+                    conn.close()
+
+                if st.button("Check S3 Buckets"):
+                    try:
+                        s3_client = get_s3_client()
+
+                        if s3_client:
+                            # Check raw bucket
+                            st.write("Raw Bucket Contents")
+                            raw_response = s3_client.list_objects_v2(
+                                Bucket=RAW_BUCKET,
+                                Prefix=UPLOADS_PREFIX
+                            )
+
+                            if 'Contents' in raw_response:
+                                for item in raw_response['Contents']:
+                                    try:
+                                        meta = s3_client.head_object(Bucket=RAW_BUCKET, Key=item['Key'])
+                                        user = meta.get('Metadata', {}).get('uploaded-by', 'unknown')
+                                        st.write(f"- {item['Key']} (User: {user})")
+                                    except:
+                                        st.write(f"- {item['Key']}")
+                            else:
+                                st.write("No files found in raw bucket")
+                    except Exception as e:
+                        st.error(f"Error checking buckets: {e}")
+    else:
+        # Prompt user to upload images first
+        st.info("Please upload images to see analysis results.")
+
+
+# Run the app
+if __name__ == "__main__":
+    main()
